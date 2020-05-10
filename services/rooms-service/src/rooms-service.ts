@@ -60,14 +60,15 @@ export default class RoomsService extends Service {
     host: 'string',
     players: { type: 'array', items: 'string', default: [] },
     spectators: { type: 'array', items: 'string', default: [] },
-    name: { type: 'string', pattern: '^[a-zA-Z0-9]+([_ -]?[a-zA-Z0-9])*$', min: 4, max: 12 },
+    name: { type: 'string', pattern: '^[a-zA-Z0-9]+([_ -]?[a-zA-Z0-9])*$', min: 2, max: 16 },
     status: { type: 'enum', values: ['pending', 'started', 'finished'], default: 'pending' },
     options: {
       type: 'object', strict: true, props: {
         decks: { type: 'array', items: 'string', min: 1 },
         target: { type: 'number', min: 5, max: 100, default: 10 },
-        maxPlayers: { type: 'number', default: 10, min: 4, max: 10 },
-        maxSpectators: { type: 'number', default: 10, min: 4, max: 10 }
+        maxPlayers: { type: 'number', default: 10, min: 2, max: 50 },
+        maxSpectators: { type: 'number', default: 10, min: 1, max: 50 },
+        roundTime: { type: 'number', default: 60, min: 15, max: 60 }
       },
     },
     passcode: { type: 'string', pattern: '^[a-zA-Z0-9]+([_ -]?[a-zA-Z0-9])*$', min: 4, max: 12, optional: true },
@@ -119,7 +120,8 @@ export default class RoomsService extends Service {
             'find': [this.afterFind] as any,
             'join-players': [this.afterAddPlayer] as any,
             'join-spectators': [this.afterAddPlayer] as any,
-            'leave': [this.afterRemovePlayer] as any
+            'leave': [this.afterRemovePlayer] as any,
+            'kick': [this.afterKickPlayer] as any
           }
         },
         actions: {
@@ -144,6 +146,13 @@ export default class RoomsService extends Service {
               clientId: { optional: true, type: 'string' },
             },
             handler: this.removePlayer
+          },
+          'kick': {
+            params: {
+              roomId: 'string',
+              clientId: 'string',
+            },
+            handler: this.kickPlayer
           },
         },
         events: {
@@ -253,6 +262,22 @@ export default class RoomsService extends Service {
   }
 
   /**
+   * After a Player has been kicked, emit a left and kicked event onto the bus.
+   *
+   * @private
+   * @param {Context<{ roomId: string; clientId: string }, any>} ctx
+   * @param {Room} res
+   * @returns
+   * @memberof RoomsService
+   */
+  private async afterKickPlayer(ctx: Context<{ roomId: string; clientId: string }, any>, res: Room) {
+    const { roomId, clientId } = ctx.params;
+    await ctx.emit(`${this.name}.player.left`, { clientId, roomId });
+    await ctx.emit(`${this.name}.player.kicked`, { clientId, roomId });
+    return res;
+  }
+
+  /**
    * Check to see if a Room with the given name already exists, before creating it.
    *
    * @private
@@ -289,6 +314,30 @@ export default class RoomsService extends Service {
   }
 
   /**
+   * Kick the user from the given room. Ensure the person performing the kick action is host.
+   *
+   * @private
+   * @param {Context<{ roomId: string; clientId: string }, { user?: { uid: string } }>} ctx
+   * @returns {Promise<Room>}
+   * @memberof RoomsService
+   */
+  private async kickPlayer(
+    ctx: Context<{ roomId: string; clientId: string }, { user?: { uid: string } }>
+  ): Promise<Room> {
+
+    const { roomId, clientId } = ctx.params;
+    const host = ctx.meta.user.uid;
+
+    const room = await ctx.call(`${this.name}.get`, { id: roomId }) as Room;
+    if (room.host !== host) {
+      return Promise.reject(new Error('Only the host can kick players.'));
+    }
+
+    return this.adapter.updateById(roomId, { $pull: { players: clientId, spectators: clientId } })
+      .then(json => this.entityChanged('updated', json, ctx).then(() => json));
+  }
+
+  /**
    * Given an _id for the room and client, add the client to the defined array.
    *
    * @private
@@ -314,7 +363,7 @@ export default class RoomsService extends Service {
         return Promise.resolve(room);
       } else {
         // user must be in another room.
-        throw forbidden('A user is only allowed to join one room at a time');
+        throw forbidden('You are already in a game.');
       }
     }
 
@@ -347,12 +396,13 @@ export default class RoomsService extends Service {
       { $pull: { players: _id, spectators: _id } },
       { returnOriginal: false }
     )
-      .then(doc => {
+      .then(async doc => {
         // Client is not in any rooms
         if (!doc.value) {
           return null;
         }
-        this.entityChanged('updated', doc.value, ctx).then(() => doc.value);
+        await ctx.emit(`${this.name}.player.left`, { clientId: _id, roomId: doc.value?._id });
+        return this.entityChanged('updated', doc.value, ctx).then(() => doc.value);
       });
   }
 

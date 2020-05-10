@@ -26,12 +26,16 @@ export default class DefaultNamespace extends BaseNamespace {
         // disconnect time added to client.
         const timeout = 60 * 1000;
         setTimeout(async () => {
-          const user = await this.broker.call('clients.get', { id: _id }) as any;
-          const afterTimeoutTime = new Date().getTime();
-          // If the user hasn't reconnected. Fire a disconnect event.
-          if (user.disconnectedAt && afterTimeoutTime - user.disconnectedAt > (timeout - 5000)) {
-            this.broker.emit('websocket-gateway.client.disconnected', { _id });
-          }
+          this.broker.call('clients.get', { id: _id })
+            .then((user: any) => {
+              const afterTimeoutTime = new Date().getTime();
+              // If the user hasn't changed socketid or reconnected. Fire a disconnect event.
+              // tslint:disable-next-line: max-line-length
+              if (user.socket === client.id && user.disconnectedAt && afterTimeoutTime - user.disconnectedAt > (timeout - 5000)) {
+                this.broker.emit('websocket-gateway.client.disconnected', { _id });
+              }
+            })
+            .catch(() => this.broker.emit('websocket-gateway.client.disconnected', { _id }));
         }, timeout);
       })
       // If error, client must have logged out.
@@ -46,6 +50,19 @@ export default class DefaultNamespace extends BaseNamespace {
     this.logger.info('Client Connected', client.id, 'to:', client.nsp.name);
     client.once('disconnect', () => this.onDisconnect(client));
 
-    this.broker.emit('websocket-gateway.client.connected', { _id, socket: client.id });
+    this.broker.call('clients.get', { id: _id })
+      // catch, client might not exist.
+      .catch((err) => null)
+      .then(async (user: any) => {
+        // Update the user with the newly connected socket, before disconnecting previous. To reduce TTL.
+        await this.broker.emit('websocket-gateway.client.connected', { _id, socket: client.id });
+        if (user && user.socket && user.socket !== client.id) {
+          // user already has a tab open. Forcefully disconnect it.
+          return this.remoteDisconnect(user.socket);
+        }
+        return null;
+      })
+      // previous socket may not have been able to be disconnected. user may have closed the tab
+      .catch((err) => null);
   }
 }
